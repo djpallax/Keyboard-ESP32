@@ -1,0 +1,6 @@
+/build/
+/trash/
+.vscode/
+.devcontainer/
+sdkconfig
+sdkconfig.old
