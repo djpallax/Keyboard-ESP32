@@ -11,9 +11,17 @@ static bool sec_conn = false;
 static bool send_volum_up = false;
 #define CHAR_DECLARATION_SIZE   (sizeof(uint8_t))
 
+#define LONG_PRESS_THRESHOLD_MS 300 // Umbral de tiempo para considerar una tecla presionada como "mantenida presionada"
+#define REPEAT_DELAY_MS 5 // Retardo entre envíos repetidos de la tecla
+
+char last_key = '\0'; // Variable para almacenar la última tecla presionada
+
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
 
 #define HIDD_DEVICE_NAME            "Pallardó Tech TEC01"
+
+#define QUEUE_LENGTH 10
+QueueHandle_t key_queue;
 
 static uint8_t hidd_service_uuid128[] = {
     /* LSB <--------------------------------------------------------------------------------> MSB */
@@ -53,11 +61,18 @@ const gpio_num_t columnasPins[FILAS] = {0,4,16,17};            // Pines de filas
 const gpio_num_t filasPins[COLUMNAS] = {5,18,19,21};     // Pines de columnas, output
 
 // Definir la matriz de teclas
+// char keys[FILAS][COLUMNAS] = {
+//     {'1', '2', '3', 'A'},
+//     {'4', '5', '6', 'B'},
+//     {'7', '8', '9', 'C'},
+//     {'*', '0', '#', 'D'}
+// };
+
 char keys[FILAS][COLUMNAS] = {
-    {'1', '2', '3', 'A'},
-    {'4', '5', '6', 'B'},
-    {'7', '8', '9', 'C'},
-    {'*', '0', '#', 'D'}
+    {HID_KEY_1, HID_KEY_2, HID_KEY_3, HID_KEY_A},                   // F1C1, F2C1, F3C1, F4C1
+    {HID_KEY_4, HID_KEY_5, HID_KEY_6, HID_KEY_B},                   // F1C2, F2C2, F3C2, F4C2
+    {HID_KEY_7, HID_KEY_8, HID_KEY_9, HID_KEY_C},                   // F1C3, F2C3, F3C3, F4C3
+    {HID_KEY_DELETE, HID_KEY_0, HID_KEY_SPACEBAR, HID_KEY_D}        // F1C4, F2C4, F3C4, F4C4
 };
 
 static void hidd_event_callback(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
@@ -237,17 +252,18 @@ void bt_init(void)
  * De ahí, se debe verificar el estado de si alguna otra tecla fue presionada previamente (a implementar)
  */
 char keypad_get_key() {
-    for (int i = 0; i < COLUMNAS; i++) {                    // Iteración por cada columna
-        gpio_set_level(columnasPins[i], 0);                 // Columna i en bajo
-        //vTaskDelay(pdMS_TO_TICKS(1));
-        for (int j = 0; j < FILAS; j++) {                // Iteración por cada fila
-            if (gpio_get_level(filasPins[j]) == 0) {     // Si la fila j está en bajo es porque se presionó esa tecla
-                gpio_set_level(columnasPins[i], 1);      // Pongo la columna en alto
-                vTaskDelay(pdMS_TO_TICKS(20));           // Debounce delay
+    
+    for (int i = 0; i < COLUMNAS; i++) {                // Iteración por cada columna
+        gpio_set_level(columnasPins[i], 0);             // Columna i en bajo
+        vTaskDelay(pdMS_TO_TICKS(1));                   // Pequeño delay antes de medir las filas
+        for (int j = 0; j < FILAS; j++) {               // Iteración por cada fila
+            if (gpio_get_level(filasPins[j]) == 0) {    // Si la fila j está en bajo es porque se presionó esa tecla
+                gpio_set_level(columnasPins[i], 1);     // Pongo la columna en alto
+                vTaskDelay(pdMS_TO_TICKS(5));           // Debounce delay
                 return keys[i][j];                       // Retorno la tecla presionada
             }
+            vTaskDelay(pdMS_TO_TICKS(1));               // Pequeño delay antes de medir la siguiente fila
         }
-
         gpio_set_level(columnasPins[i], 1);             // Pongo la columna en alto si no se encontró nada
     }
 
@@ -256,20 +272,42 @@ char keypad_get_key() {
 
 // Tarea para detectar las teclas presionadas
 void keypad_task(void *pvParameters) {
+    char last_key = '\0';
+    TickType_t last_key_tick = 0;
+    bool key_repeating = false;
+    TickType_t repeat_tick = 0;
+
     while (1) {
-        char key = keypad_get_key();
+        char key = keypad_get_key(); // Qué tecla está presionada actualmente
 
-        if (key != '\0') {
+        if (key != '\0' && key != last_key) {
             ESP_LOGI(TAG, "Tecla presionada: %c", key);
-            gpio_set_level(ledPin, 1);  // Enciendo el led
-            vTaskDelay(pdMS_TO_TICKS(20)); // delay 10 ms
-            gpio_set_level(ledPin, 0);  // Apago el led
+            gpio_set_level(ledPin, 1); // Enciende el LED
+            vTaskDelay(pdMS_TO_TICKS(10)); // Delay de 10 ms
+            gpio_set_level(ledPin, 0); // Apaga el LED
+            xQueueSend(key_queue, &key, portMAX_DELAY); // Envía la tecla a la cola
+            last_key = key; // Actualiza la última tecla presionada
+            last_key_tick = xTaskGetTickCount(); // Actualiza el tiempo de la última tecla presionada
+            key_repeating = false; // Reinicia el estado de la repetición de tecla
+            repeat_tick = 0; // Reinicia el contador de repetición de tecla
+        } else if (key != '\0' && key == last_key) {
+            TickType_t current_tick = xTaskGetTickCount();
+            if (current_tick - last_key_tick >= pdMS_TO_TICKS(LONG_PRESS_THRESHOLD_MS) && !key_repeating) {
+                // La tecla se ha mantenido presionada durante más de LONG_PRESS_THRESHOLD_MS
+                key_repeating = true; // Activa la repetición de tecla
+                repeat_tick = current_tick + pdMS_TO_TICKS(REPEAT_DELAY_MS); // Establece el tiempo para empezar a repetir la tecla
+            } else if (key_repeating && current_tick >= repeat_tick) {
+                // Empieza a repetir la tecla
+                ESP_LOGI(TAG, "Repetición de tecla: %c", key);
+                xQueueSend(key_queue, &key, portMAX_DELAY); // Envía la tecla a la cola
+                repeat_tick = current_tick + pdMS_TO_TICKS(REPEAT_DELAY_MS); // Actualiza el tiempo para la siguiente repetición
+            }
+        } else {
+            // Si la tecla se ha soltado o no se ha presionado, reinicia los estados relevantes
+            last_key = '\0';
+            key_repeating = false;
+            repeat_tick = 0;
         }
-        // else{
-        //     ESP_LOGI(TAG, "Nada che...");
-        // }
-
-        //vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -277,14 +315,32 @@ void bt_hid_task(void *pvParameters)
 {
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     while(1) {
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        //vTaskDelay(2000 / portTICK_PERIOD_MS);
+
+        // Si hay conexión
         if (sec_conn) {
+            char key; // Declare the variable "key"
+            if(xQueueReceive(key_queue, &key, portMAX_DELAY) == pdTRUE) {
+                ESP_LOGI(HID_DEMO_TAG, "Send the key: %c", key);
+                uint8_t key_vaule = {key};
+                esp_hidd_send_keyboard_value(hid_conn_id, 0, &key_vaule, 1);
+                // esp_hidd_send_consumer_value(hid_conn_id, &key_vaule, true);
+                vTaskDelay(1 / portTICK_PERIOD_MS);
+                // esp_hidd_send_consumer_value(hid_conn_id, &key_vaule, false);
+                esp_hidd_send_keyboard_value(hid_conn_id, 0, &key_vaule, 0);
+
+                
+                //hid_dev_send_report(hidd_le_env.gatt_if, HID_RPT_ID_KEY_IN, HID_REPORT_TYPE_INPUT, CHAR_DECLARATION_SIZE, &key_vaule);
+                vTaskDelay(1 / portTICK_PERIOD_MS);
+                //xQueueReset(key_queue);
+            }
             //ESP_LOGI(HID_DEMO_TAG, "Send the volume");
-            ESP_LOGI(HID_DEMO_TAG, "Send the key");
-            send_volum_up = true;
-            uint8_t key_vaule_a = {HID_KEY_A};
-            esp_hidd_send_keyboard_value(hid_conn_id, 0, &key_vaule_a, 1);
-            vTaskDelay(100 / portTICK_PERIOD_MS);
+            //ESP_LOGI(HID_DEMO_TAG, "Send the key");
+            //send_volum_up = true;
+                    // uint8_t key_vaule_a = {HID_KEY_A};
+                    // ESP_LOGI(HID_DEMO_TAG, "Send the key: %d", key_vaule_a);
+                    // esp_hidd_send_keyboard_value(hid_conn_id, 0, &key_vaule_a, 1);
+                    // vTaskDelay(200 / portTICK_PERIOD_MS);
             //esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_UP, true);
             //vTaskDelay(3000 / portTICK_PERIOD_MS);
             // if (send_volum_up) {
@@ -295,16 +351,20 @@ void bt_hid_task(void *pvParameters)
             //     esp_hidd_send_consumer_value(hid_conn_id, HID_CONSUMER_VOLUME_DOWN, false);
             // }
         }
+        //esp_task_wdt_reset();
     }
 }
 
 void app_main() {
+
+    key_queue = xQueueCreate(QUEUE_LENGTH, sizeof(char));  // Creo la cola de teclas
+
     init_led();     // Configuro el pin de salida para el led
     keypad_init();  // Configuro pines de entrada, salida y estados
     bt_init();      // Inicializo el Bluetooth
 
     ESP_LOGI(TAG, "Iniciando tarea principal...");
 
-    xTaskCreate(&keypad_task, "keypad_task", 2048, NULL, 5, NULL);   // Tarea del teclado matricial
-    xTaskCreate(&bt_hid_task, "bt_hid_task", 2048, NULL, 5, NULL);   // Tarea de la comunicaicón Bluetooth HID
+    xTaskCreate(&keypad_task, "keypad_task", 8192, NULL, 5, NULL);   // Tarea del teclado matricial
+    xTaskCreate(&bt_hid_task, "bt_hid_task", 8192, NULL, 5, NULL);   // Tarea de la comunicaicón Bluetooth HID
 }
